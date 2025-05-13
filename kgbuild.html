@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Knowledge Graph Creator / Editor</title>
+
+  <!-- ──────  styling  ────── -->
+  <style>
+    body            {font-family: Arial, sans-serif; margin: 0; padding: 1rem; background:#f9f9f9;}
+    .container      {max-width: 100%; margin: 0 auto;}
+    table           {width: 95%; border-collapse: collapse; background:#fff;}
+    th, td          {border: 1px solid #ddd; padding: 6px; text-align: left;}
+    th              {background: #eee;}
+    tr.selected     {background:#d7ebff;}
+
+    /* fixed header + scrollable body (≈ 4 rows) */
+    #kgTable thead  {display: table; width: 100%; table-layout: fixed;}
+    #kgTable tbody  {display: block; max-height: 150px; overflow-y: auto;}
+    #kgTable tbody tr{display: table; width: 100%; table-layout: fixed;}
+
+    button          {margin: 0 0.4rem 0.5rem 0; padding: 6px 12px; cursor: pointer;}
+    #sliderWrap     {display:inline-flex;align-items:center;gap:.4rem;margin-right:.8rem;}
+
+    #graph          {width: 95%; height: 700px; border:1px solid #ddd; background:#fff;}
+
+    input[type=file]{display:none;}
+    input[type=date]{border:none;background:transparent;width:100%;outline:none;}
+
+    #searchInput    {padding: 6px; width: 140px;}
+  </style>
+
+  <!-- vis‑data + vis‑network (peer libs) -->
+  <script src="https://unpkg.com/vis-data/peer/umd/vis-data.min.js"></script>
+  <link  rel="stylesheet" href="https://unpkg.com/vis-network/styles/vis-network.css">
+  <script src="https://unpkg.com/vis-network/peer/umd/vis-network.min.js"></script>
+</head>
+<body>
+<div class="container">
+
+  <!-- ──────  controls  ────── -->
+  <div>
+    <button id="addRowBtn">Add row</button>
+    <button id="deleteRowsBtn">Delete rows</button>
+    <button id="updateGraphBtn">Update graph</button>
+
+    <span id="sliderWrap">
+      Edge length:
+      <input type="range" id="edgeLenSlider" min="50" max="400" value="150">
+      <span id="edgeLenVal">150</span> px
+    </span>
+
+    <button id="saveBtn">Save JSON</button>
+    <button id="loadBtn">Load JSON</button>
+    <button id="mergeBtn">Merge JSON</button>
+
+    <!-- ─── search UI ─── -->
+    <label for="searchInput">Search terms:</label>
+    <input id="searchInput" type="text" placeholder="keyword…">
+    <button id="searchBtn">Search</button>
+
+    <input id="fileInput"  type="file" accept=".json">
+    <input id="mergeInput" type="file" accept=".json">
+  </div>
+
+  <!-- ──────  table  ────── -->
+  <table id="kgTable">
+    <thead>
+      <tr>
+        <th>Select</th>
+        <th>Date</th>
+        <th>Entity 1</th>
+        <th>Entity 2</th>
+        <th>Relation</th>
+        <th>Reference</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <!-- ──────  graph view  ────── -->
+  <div id="graph"></div>
+</div>
+
+<!-- ──────  scripts  ────── -->
+<script>
+const tableBody      = document.querySelector('#kgTable tbody');
+const addRowBtn      = document.getElementById('addRowBtn');
+const deleteRowsBtn  = document.getElementById('deleteRowsBtn');
+const updateGraphBtn = document.getElementById('updateGraphBtn');
+const saveBtn        = document.getElementById('saveBtn');
+const loadBtn        = document.getElementById('loadBtn');
+const mergeBtn       = document.getElementById('mergeBtn');
+const fileInput      = document.getElementById('fileInput');
+const mergeInput     = document.getElementById('mergeInput');
+const edgeLenSlider  = document.getElementById('edgeLenSlider');
+const edgeLenVal     = document.getElementById('edgeLenVal');
+
+const searchInput    = document.getElementById('searchInput');
+const searchBtn      = document.getElementById('searchBtn');
+
+let edgeLen = parseInt(edgeLenSlider.value);
+let network;
+const nodeIds = new Map();
+let nextNodeId = 1;
+
+/* search state */
+let lastSearchTerm = '';
+let searchHits     = [];
+let hitIndex       = -1;
+
+/* ──────────  helpers  ────────── */
+function normalizeStr(str){
+  return str.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+}
+
+/* ──────────  table helpers  ────────── */
+function addRow(date='', e1='', e2='', rel='', ref='') {
+  if (!date) date = new Date().toISOString().split('T')[0];
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td><input type="checkbox"></td>
+    <td><input type="date" value="${date}"></td>
+    <td contenteditable="true">${e1}</td>
+    <td contenteditable="true">${e2}</td>
+    <td contenteditable="true">${rel}</td>
+    <td contenteditable="true">${ref}</td>`;
+  tableBody.appendChild(tr);
+
+  tr.addEventListener('click', ev => {
+    if (ev.target.tagName !== 'INPUT' || ev.target.type === 'date') {
+      selectRow(tr);
+    }
+  });
+}
+function deleteSelectedRows() {
+  [...tableBody.rows]
+    .forEach(r => r.querySelector('input[type="checkbox"]').checked && r.remove());
+}
+function tableData() {
+  return [...tableBody.rows].map(r => {
+    const c = r.cells;
+    return {
+      date: c[1].querySelector('input').value,
+      e1  : c[2].innerText.trim(),
+      e2  : c[3].innerText.trim(),
+      rel : c[4].innerText.trim(),
+      ref : c[5].innerText.trim()
+    };
+  }).filter(r => r.e1 && r.e2 && r.rel);
+}
+function selectRow(tr){
+  [...tableBody.rows].forEach(r=>r.classList.remove('selected'));
+  tr.classList.add('selected');
+  tr.scrollIntoView({block:'nearest'});
+}
+
+/* ──────────  graph sync  ────────── */
+const MAX_LABEL = 10;
+function updateGraph() {
+  const rows = tableData();
+  nodeIds.clear();  nextNodeId = 1;
+
+  const nodes = [];
+  const edges = [];
+
+  rows.forEach((r, idx) => {
+    let id1 = nodeIds.get(r.e1);
+    if (id1 === undefined) {
+      id1 = nextNodeId++; nodeIds.set(r.e1, id1);
+      nodes.push({ id: id1, label: r.e1 });
+    }
+    let id2 = nodeIds.get(r.e2);
+    if (id2 === undefined) {
+      id2 = nextNodeId++; nodeIds.set(r.e2, id2);
+      nodes.push({ id: id2, label: r.e2 });
+    }
+
+    const fullRel  = r.rel.trim();
+    const shortRel = fullRel.length > MAX_LABEL ? fullRel.slice(0, MAX_LABEL) + '..' : fullRel;
+
+    const tooltip = `Relation: ${fullRel}
+Date: ${r.date}
+Reference: ${r.ref}`;
+
+    edges.push({
+      id:`e${idx}`, from:id1, to:id2,
+      label: shortRel, title: tooltip,
+      length: edgeLen,
+      rowIndex: idx
+    });
+  });
+
+  const data = { nodes: new vis.DataSet(nodes), edges: new vis.DataSet(edges) };
+  const options = { edges:{arrows:'to', font:{align:'middle'}}, physics:{stabilization:false} };
+
+  if (network) network.setData(data);
+  else network = new vis.Network(document.getElementById('graph'), data, options);
+
+  network.off('selectNode').on('selectNode', p => {
+    if (!p.nodes.length) return;
+    const label = [...nodeIds.entries()].find(([_, id]) => id === p.nodes[0])[0];
+    highlightRows(r => r.e1 === label || r.e2 === label);
+  });
+  network.off('selectEdge').on('selectEdge', p => {
+    if (!p.edges.length) return;
+    const edge = edges.find(e => e.id === p.edges[0]);
+    if (edge) highlightRowByIndex(edge.rowIndex);
+  });
+}
+
+/* ──────────  search  ────────── */
+function buildSearchHits(term){
+  searchHits=[]; hitIndex=-1;
+  if(!term) return;
+  const nTerm = normalizeStr(term);
+  [...tableBody.rows].forEach((tr,i)=>{
+    const cells=[...tr.cells].slice(1).map(c=>{
+      return c.tagName==='TD' ? c.innerText.trim() : '';
+    }).join(' ');
+    const nText=normalizeStr(cells);
+    if(nText.split(/\s+/).some(w=>w.startsWith(nTerm))){
+      searchHits.push(tr);
+    }
+  });
+}
+function nextHit(){
+  if(!searchHits.length) return;
+  hitIndex=(hitIndex+1)%searchHits.length;
+  selectRow(searchHits[hitIndex]);
+}
+searchBtn.addEventListener('click',()=>{
+  const term=searchInput.value.trim();
+  if(!term) return;
+  if(term!==lastSearchTerm){
+    buildSearchHits(term);
+    lastSearchTerm=term;
+  }
+  nextHit();
+});
+
+/* ──────────  highlight helpers  ────────── */
+function highlightRows(predicate) {
+  [...tableBody.rows].forEach((tr, i) => {
+    tr.classList.toggle('selected', predicate(tableData()[i]));
+  });
+}
+function highlightRowByIndex(i) {
+  [...tableBody.rows].forEach((tr, idx) => {
+    tr.classList.toggle('selected', idx === i);
+  });
+  const row=[...tableBody.rows][i];
+  if(row) row.scrollIntoView({block:'nearest'});
+}
+
+/* ──────────  persistence  ────────── */
+function saveJSON() {
+  const blob = new Blob([JSON.stringify(tableData(), null, 2)], {type:'application/json'});
+  const url  = URL.createObjectURL(blob);
+  Object.assign(document.createElement('a'), { href:url, download:'knowledge_graph.json' }).click();
+  URL.revokeObjectURL(url);
+}
+function loadFile(ev, merge=false) {
+  const file = ev.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    if (!merge) tableBody.innerHTML = '';
+    JSON.parse(e.target.result).forEach(d =>
+      addRow(d.date||'', d.e1, d.e2, d.rel, d.ref||''));
+    updateGraph();
+  };
+  reader.readAsText(file);
+  ev.target.value = '';
+}
+
+/* ──────────  wire events  ────────── */
+addRowBtn     .addEventListener('click', () => { addRow(); updateGraph(); });
+deleteRowsBtn .addEventListener('click', () => { deleteSelectedRows(); updateGraph(); });
+updateGraphBtn.addEventListener('click', updateGraph);
+saveBtn       .addEventListener('click', saveJSON);
+
+loadBtn .addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', ev => loadFile(ev, false));
+
+mergeBtn.addEventListener('click', () => mergeInput.click());
+mergeInput.addEventListener('change', ev => loadFile(ev, true));
+
+edgeLenSlider.addEventListener('input', () => {
+  edgeLen = parseInt(edgeLenSlider.value);
+  edgeLenVal.textContent = edgeLen;
+  updateGraph();
+});
+
+/* ──────────  starter row & graph  ────────── */
+addRow('', 'House', 'Kitchen', 'contains', '');
+updateGraph();
+</script>
+</body>
+</html>
